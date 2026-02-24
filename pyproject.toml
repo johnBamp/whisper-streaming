@@ -9,15 +9,40 @@ description = "Rolling-window streaming transcription helper for OpenAI Whisper"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "Your Name" }]
+authors = [{ name = "John Reid Bampfield" }]
+keywords = ["whisper", "speech-to-text", "streaming", "transcription", "audio"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
 dependencies = [
+  "numpy>=1.22",
   "openai-whisper>=20231117",
 ]
 
+[project.urls]
+Homepage = "https://github.com/johnreidbampfield/whisper-streaming"
+Repository = "https://github.com/johnreidbampfield/whisper-streaming"
+Issues = "https://github.com/johnreidbampfield/whisper-streaming/issues"
+
 [project.optional-dependencies]
+audio = [
+  "sounddevice>=0.4",
+  "pyaudio>=0.2.14",
+]
 dev = [
+  "build>=1.2",
   "pytest>=7.0",
   "ruff>=0.4",
+  "twine>=5.0",
 ]
 
 [project.scripts]
@@ -28,3 +53,7 @@ packages = ["src/whisper_streaming"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+python_files = ["test.py", "test_*.py", "*_test.py"]
+markers = [
+  "integration: tests requiring downloaded Whisper models or other external resources",
+]

@@ -6,12 +6,15 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+import numpy as np
+import pytest
 import whisper
 
 # Support running this file directly without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from whisper_streaming import StreamConfig, StreamTranscriber
 from whisper_streaming.core import _trim_text_overlap
+from whisper_streaming.sources import AudioSource, FileAudioSource, RecordingAudioSource
 
 
 def _write_silence_wav(path: str, seconds: float = 1.2, sr: int = 16000) -> None:
@@ -38,7 +41,21 @@ class FakeModel:
         return {"segments": segments}
 
 
+class FakeAudioSource(AudioSource):
+    def __init__(self, chunks: List[np.ndarray], sample_rate: int = 16000) -> None:
+        super().__init__(sample_rate=sample_rate, chunk_sec=1.0)
+        self._chunks = chunks
+
+    def chunks(self):
+        for chunk in self._chunks:
+            yield chunk
+
+
+@pytest.mark.integration
 def test_stream_file_emits_done_and_monotonic_commits():
+    if os.getenv("WHISPER_INTEGRATION") != "1":
+        pytest.skip("Set WHISPER_INTEGRATION=1 to run integration tests.")
+
     model = whisper.load_model("tiny.en")
 
     with tempfile.TemporaryDirectory() as td:
@@ -179,3 +196,84 @@ def test_trim_overlap_handles_punctuation_drift():
     candidate = "What happens if an immovable object meets an unstoppable force, is a popular question on the internet."
     trimmed = _trim_text_overlap(existing, candidate)
     assert trimmed == "is a popular question on the internet."
+
+
+def test_stream_dispatch_uses_existing_file_path_logic():
+    scripted = [
+        [{"start": 0.0, "end": 1.0, "text": " Hello world."}],
+        [{"start": 0.0, "end": 2.0, "text": " Hello world. More text."}],
+    ]
+    model = FakeModel(scripted)
+
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = os.path.join(td, "short.wav")
+        _write_silence_wav(wav_path, seconds=2.0)
+        source = FileAudioSource(wav_path, chunk_sec=0.2)
+
+        cfg = StreamConfig(step_sec=1.0, window_sec=2.0, commit_lag_sec=0.0, sleep_to_simulate_realtime=False)
+        st = StreamTranscriber(model, cfg)
+
+        done_evt = None
+        for evt in st.stream(source):
+            if evt["type"] == "done":
+                done_evt = evt
+                break
+
+        assert done_evt is not None
+        assert done_evt["text"] == "Hello world. More text."
+        assert model.calls == 2
+
+
+def test_stream_source_accepts_incremental_audio_chunks():
+    scripted = [
+        [{"start": 0.0, "end": 1.0, "text": " Hello world."}],
+        [{"start": 0.0, "end": 2.0, "text": " Hello world. More text."}],
+    ]
+    model = FakeModel(scripted)
+    source = FakeAudioSource(
+        chunks=[
+            np.zeros(16000, dtype=np.float32),
+            np.zeros(16000, dtype=np.float32),
+        ]
+    )
+
+    cfg = StreamConfig(step_sec=1.0, window_sec=2.0, commit_lag_sec=0.0, sleep_to_simulate_realtime=False)
+    st = StreamTranscriber(model, cfg)
+
+    done_evt = None
+    for evt in st.stream_source(source):
+        if evt["type"] == "done":
+            done_evt = evt
+            break
+
+    assert done_evt is not None
+    assert done_evt["text"] == "Hello world. More text."
+    assert model.calls == 2
+
+
+def test_recording_audio_source_captures_and_writes_wav():
+    source = FakeAudioSource(
+        chunks=[
+            np.ones(16000, dtype=np.float32) * 0.25,
+            np.ones(16000, dtype=np.float32) * -0.25,
+        ]
+    )
+    recorder = RecordingAudioSource(source)
+
+    for _ in recorder.chunks():
+        pass
+
+    assert recorder.has_audio
+    assert recorder.recorded_seconds == 2.0
+    assert recorder.recorded_peak() > 0.0
+    assert recorder.recorded_rms() > 0.0
+
+    with tempfile.TemporaryDirectory() as td:
+        out_wav = os.path.join(td, "capture.wav")
+        recorder.save_wav(out_wav, normalize=True)
+
+        with wave.open(out_wav, "rb") as wf:
+            assert wf.getnchannels() == 1
+            assert wf.getsampwidth() == 2
+            assert wf.getframerate() == 16000
+            assert wf.getnframes() == 32000

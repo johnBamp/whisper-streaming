@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local debug captures
+mic_debug_capture_*.wav
+
+# OS/editor noise
+.DS_Store
