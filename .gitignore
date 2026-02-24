@@ -24,3 +24,4 @@ mic_debug_capture_*.wav
 
 # OS/editor noise
 .DS_Store
+model.arpa

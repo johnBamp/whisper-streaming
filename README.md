@@ -19,6 +19,18 @@ For microphone backends:
 python3 -m pip install 'whisper-streaming[audio]'
 ```
 
+For Silero VAD decode gating:
+
+```bash
+python3 -m pip install 'whisper-streaming[vad]'
+```
+
+For KenLM beam rescoring:
+
+```bash
+python3 -m pip install 'whisper-streaming[lm]'
+```
+
 ## Quickstart (Library)
 
 ```python
@@ -43,6 +55,30 @@ File transcription:
 
 ```bash
 whisper-stream sample.wav --model tiny.en
+```
+
+File transcription with VAD + silence gating (skip no-speech decode windows):
+
+```bash
+whisper-stream sample.wav --model tiny.en --vad --silence-rms-threshold 0.002
+```
+
+Beam-only decoding:
+
+```bash
+whisper-stream sample.wav --model tiny.en --beam-size 8
+```
+
+Beam + KenLM rescoring:
+
+```bash
+whisper-stream sample.wav --model tiny.en --beam-size 8 --lm-rescore --lm-path ./model.arpa --lm-alpha 0.25 --lm-beta 0.0
+```
+
+Max speed profile (lower update cadence, keeps quality high on continuous speech clips):
+
+```bash
+whisper-stream sample.wav --model tiny.en --step 3.0 --window 9.0 --lag 1.0 --no-vad
 ```
 
 Live microphone transcription:
@@ -70,6 +106,22 @@ WebSocket / RTSP input (requires `ffmpeg`):
 whisper-stream --source websocket --url ws://localhost:9000/audio
 whisper-stream --source rtsp --url rtsp://camera.local/stream --rtsp-transport tcp
 ```
+
+Tune Silero VAD behavior:
+
+```bash
+whisper-stream sample.wav --vad --vad-backend onnx --vad-threshold 0.45 --vad-min-speech-ms 180 --vad-min-silence-ms 120 --vad-speech-pad-ms 40
+```
+
+For long streams, adaptive VAD bypass avoids VAD overhead when every window already has speech:
+
+```bash
+whisper-stream sample.wav --vad --vad-adaptive-disable-ticks 8 --vad-recheck-interval-ticks 12
+```
+
+LM rescoring notes:
+- Rescoring is opt-in (`--lm-rescore`) and only applied for `--task transcribe`.
+- If `--lm-rescore` is enabled in transcribe mode and LM setup is invalid, the CLI fails fast with an actionable error.
 
 ## API Notes
 

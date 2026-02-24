@@ -32,10 +32,12 @@ class FakeModel:
     def __init__(self, scripted_results: List[List[Dict[str, Any]]]) -> None:
         self.scripted_results = scripted_results
         self.calls = 0
+        self.kwargs_history: List[Dict[str, Any]] = []
 
-    def transcribe(self, *_args, **_kwargs) -> Dict[str, Any]:
+    def transcribe(self, *_args, **kwargs) -> Dict[str, Any]:
         if self.calls >= len(self.scripted_results):
             raise AssertionError("Unexpected extra transcribe call; stream did not terminate as expected.")
+        self.kwargs_history.append(dict(kwargs))
         segments = self.scripted_results[self.calls]
         self.calls += 1
         return {"segments": segments}
@@ -49,6 +51,18 @@ class FakeAudioSource(AudioSource):
     def chunks(self):
         for chunk in self._chunks:
             yield chunk
+
+
+class FakeVAD:
+    def __init__(self, scripted_spans: List[List[Dict[str, Any]]]) -> None:
+        self.scripted_spans = scripted_spans
+        self.calls = 0
+
+    def speech_timestamps(self, _audio: np.ndarray, _sample_rate: int) -> List[Dict[str, Any]]:
+        idx = min(self.calls, max(0, len(self.scripted_spans) - 1))
+        spans = self.scripted_spans[idx] if self.scripted_spans else []
+        self.calls += 1
+        return spans
 
 
 @pytest.mark.integration
@@ -189,6 +203,146 @@ def test_stream_file_skips_small_time_jitter_commits():
         assert done_evt is not None
         assert done_evt["text"] == "Hello world"
         assert model.calls == 3
+
+
+def test_stream_file_forwards_beam_decode_options():
+    scripted = [
+        [{"start": 0.0, "end": 1.0, "text": " Hello"}],
+        [{"start": 0.0, "end": 2.0, "text": " Hello world"}],
+        [{"start": 0.0, "end": 2.0, "text": " Hello world"}],
+    ]
+    model = FakeModel(scripted)
+
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = os.path.join(td, "short.wav")
+        _write_silence_wav(wav_path, seconds=2.0)
+
+        cfg = StreamConfig(
+            step_sec=1.0,
+            window_sec=2.0,
+            commit_lag_sec=0.0,
+            beam_size=8,
+            beam_patience=1.2,
+            beam_length_penalty=0.4,
+            sleep_to_simulate_realtime=False,
+        )
+        st = StreamTranscriber(model, cfg)
+
+        done_evt = None
+        for evt in st.stream_file(wav_path):
+            if evt["type"] == "done":
+                done_evt = evt
+                break
+
+        assert done_evt is not None
+        assert model.kwargs_history
+        assert all(kwargs.get("beam_size") == 8 for kwargs in model.kwargs_history)
+        assert all(kwargs.get("patience") == 1.2 for kwargs in model.kwargs_history)
+        assert all(kwargs.get("length_penalty") == 0.4 for kwargs in model.kwargs_history)
+
+
+def test_stream_file_silence_rms_gating_skips_decode():
+    model = FakeModel([])
+
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = os.path.join(td, "silence.wav")
+        _write_silence_wav(wav_path, seconds=2.0)
+
+        cfg = StreamConfig(
+            step_sec=1.0,
+            window_sec=2.0,
+            commit_lag_sec=0.0,
+            silence_rms_threshold=0.01,
+            sleep_to_simulate_realtime=False,
+        )
+        st = StreamTranscriber(model, cfg)
+
+        done_evt = None
+        for evt in st.stream_file(wav_path):
+            if evt["type"] == "done":
+                done_evt = evt
+                break
+
+        assert done_evt is not None
+        assert done_evt["text"] == ""
+        assert model.calls == 0
+        assert done_evt["decode_performed"] == 0
+        assert done_evt["decode_skipped_silence"] >= 1
+
+
+def test_stream_file_vad_gating_skips_no_speech_ticks():
+    scripted = [
+        [{"start": 0.0, "end": 2.0, "text": " Hello there."}],
+    ]
+    model = FakeModel(scripted)
+    vad = FakeVAD(
+        scripted_spans=[
+            [],
+            [{"start": 4000, "end": 28000}],
+        ]
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = os.path.join(td, "short.wav")
+        _write_silence_wav(wav_path, seconds=2.0)
+
+        cfg = StreamConfig(
+            step_sec=1.0,
+            window_sec=2.0,
+            commit_lag_sec=0.0,
+            vad_enabled=True,
+            sleep_to_simulate_realtime=False,
+        )
+        st = StreamTranscriber(model, cfg, vad_detector=vad)
+
+        done_evt = None
+        for evt in st.stream_file(wav_path):
+            if evt["type"] == "done":
+                done_evt = evt
+                break
+
+        assert done_evt is not None
+        assert done_evt["text"] == "Hello there."
+        assert model.calls == 1
+        assert done_evt["decode_performed"] == 1
+        assert done_evt["decode_skipped_vad"] >= 1
+
+
+def test_stream_file_vad_adaptive_bypass_reduces_vad_calls():
+    scripted = [[], [], [], [], []]
+    model = FakeModel(scripted)
+    vad = FakeVAD(
+        scripted_spans=[
+            [{"start": 1000, "end": 32000}],
+        ]
+    )
+
+    with tempfile.TemporaryDirectory() as td:
+        wav_path = os.path.join(td, "short.wav")
+        _write_silence_wav(wav_path, seconds=4.0)
+
+        cfg = StreamConfig(
+            step_sec=1.0,
+            window_sec=2.0,
+            commit_lag_sec=0.0,
+            vad_enabled=True,
+            vad_adaptive_disable_ticks=2,
+            vad_recheck_interval_ticks=3,
+            sleep_to_simulate_realtime=False,
+        )
+        st = StreamTranscriber(model, cfg, vad_detector=vad)
+
+        done_evt = None
+        for evt in st.stream_file(wav_path):
+            if evt["type"] == "done":
+                done_evt = evt
+                break
+
+        assert done_evt is not None
+        assert model.calls == 5
+        assert vad.calls == 2
+        assert done_evt["decode_vad_bypassed"] == 3
+        assert done_evt["decode_skipped_vad"] == 0
 
 
 def test_trim_overlap_handles_punctuation_drift():

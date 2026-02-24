@@ -144,14 +144,92 @@ def main(argv=None) -> int:
     p.add_argument("--rtsp-transport", default="tcp", choices=["tcp", "udp"])
     p.add_argument("--ffmpeg-bin", default="ffmpeg", help="ffmpeg executable name/path for websocket/RTSP")
     p.add_argument("--model", default="tiny.en", help="Whisper model name (e.g., tiny.en, base, small)")
-    p.add_argument("--step", type=float, default=0.5, help="Tick step seconds")
-    p.add_argument("--window", type=float, default=8.0, help="Rolling window seconds")
+    p.add_argument("--step", type=float, default=3.0, help="Tick step seconds")
+    p.add_argument("--window", type=float, default=9.0, help="Rolling window seconds")
     p.add_argument("--lag", type=float, default=1.0, help="Commit lag seconds (stability delay)")
     p.add_argument(
         "--min-commit-advance",
         type=float,
         default=0.35,
         help="Minimum segment end-time advance (seconds) before accepting a new commit.",
+    )
+    p.add_argument("--beam-size", type=int, default=None, help="Beam width for Whisper decode.")
+    p.add_argument("--beam-patience", type=float, default=None, help="Beam search patience value.")
+    p.add_argument(
+        "--beam-length-penalty",
+        type=float,
+        default=None,
+        help="Length penalty alpha in [0,1] used for beam ranking.",
+    )
+    p.add_argument(
+        "--lm-rescore",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable KenLM-based beam rescoring (transcribe task only).",
+    )
+    p.add_argument("--lm-path", default=None, help="Path to KenLM model (.arpa or .bin).")
+    p.add_argument("--lm-alpha", type=float, default=0.25, help="LM weight for fused score.")
+    p.add_argument("--lm-beta", type=float, default=0.0, help="Word-count bonus weight for fused score.")
+    p.add_argument("--lm-top-n", type=int, default=None, help="Rescore top-N beam candidates (default: beam size).")
+    p.add_argument(
+        "--lm-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize candidate text before LM scoring.",
+    )
+    p.add_argument(
+        "--vad",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Silero VAD to skip Whisper decode on no-speech windows.",
+    )
+    p.add_argument(
+        "--vad-threshold",
+        type=float,
+        default=0.5,
+        help="Silero VAD speech probability threshold (0-1).",
+    )
+    p.add_argument(
+        "--vad-min-speech-ms",
+        type=int,
+        default=250,
+        help="Silero VAD minimum speech span in milliseconds.",
+    )
+    p.add_argument(
+        "--vad-min-silence-ms",
+        type=int,
+        default=100,
+        help="Silero VAD minimum silence span in milliseconds.",
+    )
+    p.add_argument(
+        "--vad-speech-pad-ms",
+        type=int,
+        default=30,
+        help="Silero VAD padding added around detected speech in milliseconds.",
+    )
+    p.add_argument(
+        "--vad-backend",
+        default="onnx",
+        choices=["onnx", "torch"],
+        help="Silero backend. onnx is usually faster on CPU.",
+    )
+    p.add_argument(
+        "--vad-adaptive-disable-ticks",
+        type=int,
+        default=8,
+        help="After this many consecutive VAD checks that all contain speech, bypass VAD for a while (0 disables).",
+    )
+    p.add_argument(
+        "--vad-recheck-interval-ticks",
+        type=int,
+        default=12,
+        help="When adaptive bypass is active, re-run VAD after this many ticks.",
+    )
+    p.add_argument(
+        "--silence-rms-threshold",
+        type=float,
+        default=0.0,
+        help="Skip decode when window RMS is below this value (0 disables).",
     )
     p.add_argument("--realtime", action="store_true", help="Sleep to simulate realtime playback")
     p.add_argument("--language", default=None, help="Force language code (e.g., en), otherwise auto")
@@ -177,6 +255,37 @@ def main(argv=None) -> int:
         p.error("--url is required when --source=websocket or --source=rtsp")
     if args.debug_mic_capture and args.source != "mic":
         p.error("--debug-mic-capture is only supported with --source=mic")
+    if args.beam_size is not None and args.beam_size <= 0:
+        p.error("--beam-size must be > 0")
+    if args.beam_patience is not None and args.beam_patience <= 0:
+        p.error("--beam-patience must be > 0")
+    if args.beam_length_penalty is not None and not (0.0 <= args.beam_length_penalty <= 1.0):
+        p.error("--beam-length-penalty must be between 0 and 1")
+    if args.lm_top_n is not None and args.lm_top_n <= 0:
+        p.error("--lm-top-n must be > 0")
+
+    effective_beam_size = args.beam_size
+    if effective_beam_size is None and args.lm_rescore and args.task == "transcribe":
+        effective_beam_size = 8
+    if args.beam_patience is not None and effective_beam_size is None:
+        p.error("--beam-patience requires --beam-size or --lm-rescore with --task=transcribe")
+
+    if args.lm_rescore and args.task == "transcribe" and not args.lm_path:
+        p.error("--lm-path is required when --lm-rescore is enabled for transcribe")
+    if not (0.0 <= args.vad_threshold <= 1.0):
+        p.error("--vad-threshold must be between 0 and 1")
+    if args.vad_min_speech_ms < 0:
+        p.error("--vad-min-speech-ms must be >= 0")
+    if args.vad_min_silence_ms < 0:
+        p.error("--vad-min-silence-ms must be >= 0")
+    if args.vad_speech_pad_ms < 0:
+        p.error("--vad-speech-pad-ms must be >= 0")
+    if args.vad_adaptive_disable_ticks < 0:
+        p.error("--vad-adaptive-disable-ticks must be >= 0")
+    if args.vad_recheck_interval_ticks < 0:
+        p.error("--vad-recheck-interval-ticks must be >= 0")
+    if args.silence_rms_threshold < 0:
+        p.error("--silence-rms-threshold must be >= 0")
 
     model = whisper.load_model(args.model)
 
@@ -189,6 +298,24 @@ def main(argv=None) -> int:
         language=args.language,
         task=args.task,
         use_initial_prompt=args.use_initial_prompt,
+        beam_size=args.beam_size,
+        beam_patience=args.beam_patience,
+        beam_length_penalty=args.beam_length_penalty,
+        lm_rescore_enabled=args.lm_rescore,
+        lm_path=args.lm_path,
+        lm_alpha=args.lm_alpha,
+        lm_beta=args.lm_beta,
+        lm_top_n=args.lm_top_n,
+        lm_normalize_text=args.lm_normalize,
+        vad_enabled=args.vad,
+        vad_threshold=args.vad_threshold,
+        vad_min_speech_ms=args.vad_min_speech_ms,
+        vad_min_silence_ms=args.vad_min_silence_ms,
+        vad_speech_pad_ms=args.vad_speech_pad_ms,
+        vad_backend=args.vad_backend,
+        vad_adaptive_disable_ticks=args.vad_adaptive_disable_ticks,
+        vad_recheck_interval_ticks=args.vad_recheck_interval_ticks,
+        silence_rms_threshold=args.silence_rms_threshold,
     )
     st = StreamTranscriber(model, cfg)
 
@@ -247,12 +374,37 @@ def main(argv=None) -> int:
             clip_sec = float(evt.get("t", 0.0))
             committed_sec = min(float(evt.get("committed_until", 0.0)), clip_sec)
             speed = (clip_sec / wall_sec) if wall_sec > 0 else 0.0
+            decode_ticks = int(evt.get("decode_ticks", 0))
+            decode_performed = int(evt.get("decode_performed", 0))
+            decode_skipped_short = int(evt.get("decode_skipped_short_chunk", 0))
+            decode_skipped_silence = int(evt.get("decode_skipped_silence", 0))
+            decode_skipped_vad = int(evt.get("decode_skipped_vad", 0))
+            decode_vad_bypassed = int(evt.get("decode_vad_bypassed", 0))
+            rescore_decode_calls = int(evt.get("rescore_decode_calls", 0))
+            rescore_applied = int(evt.get("rescore_applied", 0))
+            rescore_changed = int(evt.get("rescore_changed_hypothesis", 0))
+            rescore_candidate_total = int(evt.get("rescore_candidate_total", 0))
+            rescore_candidate_avg = float(evt.get("rescore_candidate_avg", 0.0))
             print(
                 "\nDEBUG:\n"
                 f"- clip_duration_sec: {clip_sec:.2f}\n"
                 f"- committed_until_sec: {committed_sec:.2f}\n"
                 f"- transcription_wall_sec: {wall_sec:.2f}\n"
-                f"- speed_vs_realtime: {speed:.2f}x"
+                f"- speed_vs_realtime: {speed:.2f}x\n"
+                f"- lm_rescore_enabled: {str(args.lm_rescore).lower()}\n"
+                f"- vad_enabled: {str(args.vad).lower()}\n"
+                f"- vad_backend: {args.vad_backend}\n"
+                f"- decode_ticks: {decode_ticks}\n"
+                f"- decode_performed: {decode_performed}\n"
+                f"- decode_skipped_short_chunk: {decode_skipped_short}\n"
+                f"- decode_skipped_silence: {decode_skipped_silence}\n"
+                f"- decode_skipped_vad: {decode_skipped_vad}\n"
+                f"- decode_vad_bypassed: {decode_vad_bypassed}\n"
+                f"- rescore_decode_calls: {rescore_decode_calls}\n"
+                f"- rescore_applied: {rescore_applied}\n"
+                f"- rescore_changed_hypothesis: {rescore_changed}\n"
+                f"- rescore_candidate_total: {rescore_candidate_total}\n"
+                f"- rescore_candidate_avg: {rescore_candidate_avg:.2f}"
             )
 
     if recorder is not None:
